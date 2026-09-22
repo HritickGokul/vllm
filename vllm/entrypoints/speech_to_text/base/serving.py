@@ -30,6 +30,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EncoderDecoderInput, EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs, Logprob
+from vllm.lora.request import LoRARequest
 from vllm.model_executor.models import SupportsTranscription
 from vllm.multimodal.audio import get_audio_duration, split_audio
 from vllm.multimodal.media.audio import load_audio
@@ -77,6 +78,8 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+_TIMESTAMP_SECONDS = 0.02
 
 
 def asr_inter_chunk_separator(
@@ -152,6 +155,9 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         self._decode_and_chunk_speech_async = make_async_with_semaphore(
             self._decode_and_chunk_speech, executor=self._preprocess_executor
         )
+        self._decode_speech_async = make_async_with_semaphore(
+            self._decode_speech, executor=self._preprocess_executor
+        )
 
     @cached_property
     def model_cls(self) -> type[SupportsTranscription]:
@@ -163,10 +169,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
     def shutdown(self) -> None:
         self._preprocess_executor.shutdown(wait=False)
 
-    def _decode_and_chunk_speech(
-        self,
-        audio_data: bytes,
-    ) -> tuple[list[np.ndarray], float]:
+    def _decode_speech(self, audio_data: bytes) -> tuple[np.ndarray, float]:
         # Decode audio bytes.  For container formats (MP4, M4A, WebM) that
         # soundfile cannot detect from a BytesIO stream, _load_audio_bytes
         # transparently falls back to ffmpeg via an in-memory fd.
@@ -187,6 +190,13 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             raise ValueError("Invalid or unsupported audio file.") from exc
 
         duration = get_audio_duration(y=y, sr=sr)
+        return y, duration
+
+    def _decode_and_chunk_speech(
+        self,
+        audio_data: bytes,
+    ) -> tuple[list[np.ndarray], float]:
+        y, duration = self._decode_speech(audio_data)
         do_split_audio = self.asr_config.allow_audio_chunking and (
             self.asr_config.max_audio_clip_s is not None
             and duration > self.asr_config.max_audio_clip_s
@@ -199,7 +209,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             assert self.asr_config.min_energy_split_window_size is not None
             chunks = split_audio(
                 audio_data=y,
-                sample_rate=int(sr),
+                sample_rate=int(self.asr_config.sample_rate),
                 max_clip_duration_s=self.asr_config.max_audio_clip_s,
                 overlap_duration_s=self.asr_config.overlap_chunk_second,
                 min_energy_window_size=self.asr_config.min_energy_split_window_size,
@@ -264,13 +274,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         audio_data: bytes,
         request_id: str,
     ) -> tuple[list[EngineInput], float, list[float]]:
-        # Validate request
-        request.language = self.model_cls.validate_language(request.language)
-        request.to_language = (
-            self.model_cls.validate_language(request.to_language)
-            if request.to_language
-            else None
-        )
+        self._validate_speech_to_text_request(request)
 
         # Run cpu intensive preprocess step in a separate thread pool executor.
         chunks, duration = await self._decode_and_chunk_speech_async(audio_data)
@@ -290,28 +294,38 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 chunks[0], f"{request_id}-lang_detect"
             )
 
-        parsed_prompts: list[DictPrompt] = []
-        for chunk in chunks:
-            stt_params = request.build_stt_params(
-                audio=chunk,
-                stt_config=self.asr_config,
-                model_config=self.model_config,
-                task_type=self.task_type,
-            )
-            prompt = self.model_cls.get_generation_prompt(stt_params)
-
-            parsed_prompt: DictPrompt
-            if request.response_format == "verbose_json":
-                parsed_prompt = parse_enc_dec_prompt(prompt)
-                parsed_prompt = self._preprocess_verbose_prompt(parsed_prompt)
-            else:
-                parsed_prompt = parse_model_prompt(self.model_config, prompt)
-
-            parsed_prompts.append(parsed_prompt)
+        parsed_prompts = [
+            self._build_speech_to_text_prompt(request, chunk) for chunk in chunks
+        ]
 
         engine_inputs = await self.renderer.render_cmpl_async(parsed_prompts)
 
         return engine_inputs, duration, chunk_start_offsets
+
+    def _validate_speech_to_text_request(self, request: SpeechToTextRequest) -> None:
+        request.language = self.model_cls.validate_language(request.language)
+        request.to_language = (
+            self.model_cls.validate_language(request.to_language)
+            if request.to_language
+            else None
+        )
+
+    def _build_speech_to_text_prompt(
+        self, request: SpeechToTextRequest, audio: np.ndarray
+    ) -> DictPrompt:
+        stt_params = request.build_stt_params(
+            audio=audio,
+            stt_config=self.asr_config,
+            model_config=self.model_config,
+            task_type=self.task_type,
+        )
+        prompt = self.model_cls.get_generation_prompt(stt_params)
+
+        if request.response_format == "verbose_json":
+            parsed_prompt = parse_enc_dec_prompt(prompt)
+            return self._preprocess_verbose_prompt(parsed_prompt)
+
+        return parse_model_prompt(self.model_config, prompt)
 
     def _preprocess_verbose_prompt(self, prompt: EncoderDecoderDictPrompt):
         dec_prompt = prompt["decoder_prompt"]
@@ -350,6 +364,38 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         return input_len
 
+    def _get_speech_to_text_sampling_params(
+        self,
+        request: SpeechToTextRequest,
+        engine_inputs: list[EngineInput],
+    ) -> SamplingParams | BeamSearchParams:
+        input_len = (
+            self._get_decoder_prompt_len(engine_inputs)
+            if request.use_beam_search
+            else 0
+        )
+        max_tokens = get_max_tokens(
+            self.model_config.max_model_len,
+            request.max_completion_tokens,
+            input_len,
+            self.default_sampling_params,
+        )
+
+        if request.use_beam_search:
+            sampling_params = request.to_beam_search_params(
+                max_tokens, self.default_sampling_params
+            )
+        else:
+            sampling_params = request.to_sampling_params(
+                max_tokens,
+                self.default_sampling_params,
+            )
+
+        if request.response_format == "verbose_json":
+            sampling_params.logprobs = 1
+
+        return sampling_params
+
     def _get_verbose_segments(
         self,
         tokens: tuple,
@@ -357,6 +403,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         request: SpeechToTextRequest,
         segment_class: type[SpeechToTextSegment],
         start_time: float = 0,
+        window_duration: float | None = None,
     ) -> list[SpeechToTextSegment]:
         """Convert tokens to verbose segments.
 
@@ -368,10 +415,13 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         Note: No_speech_prob field is not supported
         in this implementation and will be None. See docs for details.
         """
-        BASE_OFFSET = 0.02
         init_token = self.tokenizer.encode("<|0.00|>", add_special_tokens=False)[0]
+        if not tokens:
+            return []
         if tokens[-1] == self.tokenizer.eos_token_id:
             tokens = tokens[:-1]
+        if not tokens:
+            return []
 
         tokens_with_start = (init_token,) + tokens
         segments: list[SpeechToTextSegment] = []
@@ -396,8 +446,8 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     segment_class(
                         id=len(segments),
                         seek=int(start_time),
-                        start=start_time + BASE_OFFSET * start_timestamp,
-                        end=start_time + BASE_OFFSET * end_timestamp,
+                        start=start_time + _TIMESTAMP_SECONDS * start_timestamp,
+                        end=start_time + _TIMESTAMP_SECONDS * end_timestamp,
                         temperature=request.temperature,
                         text=text,
                         # The compression ratio measures
@@ -415,7 +465,215 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 avg_logprob = 0
             else:
                 avg_logprob += log_probs[idx - 1][token].logprob
+
+        if not segments and window_duration is not None:
+            text_tokens = [token for token in tokens if token < init_token]
+            text = self.tokenizer.decode(text_tokens)
+            if text:
+                timestamp_tokens = [token for token in tokens if token >= init_token]
+                segment_duration = window_duration
+                if timestamp_tokens and timestamp_tokens[-1] != init_token:
+                    segment_duration = (
+                        timestamp_tokens[-1] - init_token
+                    ) * _TIMESTAMP_SECONDS
+                text_bytes = text.encode("utf-8")
+                avg_logprob = sum(
+                    log_probs[idx][token].logprob for idx, token in enumerate(tokens)
+                ) / len(tokens)
+                segments.append(
+                    cast(
+                        SpeechToTextSegment,
+                        segment_class(
+                            id=0,
+                            seek=int(start_time),
+                            start=start_time,
+                            end=start_time + segment_duration,
+                            temperature=request.temperature,
+                            text=text,
+                            compression_ratio=len(text_bytes)
+                            / len(zlib.compress(text_bytes)),
+                            tokens=text_tokens,
+                            avg_logprob=avg_logprob,
+                        ),
+                    )
+                )
         return segments
+
+    def _get_verbose_seek_offset(self, tokens: tuple[int, ...]) -> float | None:
+        """Return the local timestamp where an unfinished window should resume."""
+        init_token = self.tokenizer.encode("<|0.00|>", add_special_tokens=False)[0]
+        if tokens and tokens[-1] == self.tokenizer.eos_token_id:
+            tokens = tokens[:-1]
+        if len(tokens) < 2:
+            return None
+
+        tokens_with_start = (init_token,) + tokens
+        timestamp_tokens = [token >= init_token for token in tokens_with_start]
+        single_timestamp_ending = timestamp_tokens[-2:] == [False, True]
+        consecutive = [
+            idx
+            for idx in range(1, len(timestamp_tokens))
+            if timestamp_tokens[idx - 1] and timestamp_tokens[idx]
+        ]
+        if not consecutive or single_timestamp_ending:
+            return None
+
+        last_boundary = consecutive[-1]
+        timestamp = tokens_with_start[last_boundary - 1] - init_token
+        return timestamp * _TIMESTAMP_SECONDS
+
+    async def _create_seek_based_verbose_response(
+        self,
+        audio_data: bytes,
+        request: SpeechToTextRequest,
+        raw_request: Request | None,
+        request_id: str,
+        lora_request: LoRARequest | None,
+    ) -> SpeechToTextResponseVerbose:
+        self._validate_speech_to_text_request(request)
+        audio, duration_s = await self._decode_speech_async(audio_data)
+
+        sample_rate = self.asr_config.sample_rate
+        max_clip_s = self.asr_config.max_audio_clip_s
+        max_samples = (
+            max(1, round(max_clip_s * sample_rate))
+            if max_clip_s is not None
+            else max(1, audio.shape[-1])
+        )
+
+        if request.language is None and getattr(
+            self.model_cls, "supports_explicit_language_detection", False
+        ):
+            request.language = await self._detect_language(
+                audio[..., :max_samples], f"{request_id}-lang_detect"
+            )
+
+        segments_types: dict[str, type[SpeechToTextSegment]] = {
+            "transcribe": TranscriptionSegment,
+            "translate": TranslationSegment,
+        }
+        segment_class = segments_types[self.task_type]
+        all_segments: list[SpeechToTextSegment] = []
+        engine_request_ids: list[str] = []
+        sampling_params: SamplingParams | BeamSearchParams | None = None
+        seek = 0
+        window_idx = 0
+
+        try:
+            while seek < audio.shape[-1]:
+                window_end = min(seek + max_samples, audio.shape[-1])
+                audio_chunk = audio[..., seek:window_end]
+                parsed_prompt = self._build_speech_to_text_prompt(request, audio_chunk)
+                engine_inputs = await self.renderer.render_cmpl_async([parsed_prompt])
+                assert len(engine_inputs) == 1
+                engine_input = engine_inputs[0]
+
+                if sampling_params is None:
+                    sampling_params = self._get_speech_to_text_sampling_params(
+                        request, engine_inputs
+                    )
+
+                engine_request_id = (
+                    request_id if window_idx == 0 else f"{request_id}-{window_idx}"
+                )
+                engine_request_ids.append(engine_request_id)
+                self._log_inputs(
+                    engine_request_id,
+                    engine_input,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                )
+                trace_headers = (
+                    None
+                    if raw_request is None
+                    else await self._get_trace_headers(raw_request.headers)
+                )
+
+                if isinstance(sampling_params, BeamSearchParams):
+                    result_generator = self.beam_search(
+                        prompt=engine_input,
+                        params=sampling_params,
+                        request_id=engine_request_id,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                    )
+                else:
+                    result_generator = self.engine_client.generate(
+                        engine_input,
+                        sampling_params,
+                        engine_request_id,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                    )
+
+                final_output: RequestOutput | None = None
+                async for output in result_generator:
+                    final_output = output
+                    if output.finished:
+                        break
+                assert final_output is not None
+                completion = final_output.outputs[0]
+                assert completion.logprobs
+                tokens = tuple(completion.token_ids)
+                start_time = seek / sample_rate
+                window_segments = self._get_verbose_segments(
+                    tokens=tokens,
+                    segment_class=segment_class,
+                    request=request,
+                    start_time=start_time,
+                    window_duration=(window_end - seek) / sample_rate,
+                    log_probs=completion.logprobs,
+                )
+                for segment in window_segments:
+                    segment.id = len(all_segments)
+                    all_segments.append(segment)
+
+                seek_offset_s = self._get_verbose_seek_offset(tokens)
+                seek_offset = (
+                    round(seek_offset_s * sample_rate)
+                    if seek_offset_s is not None
+                    else None
+                )
+                if seek_offset is None or not 0 < seek_offset < window_end - seek:
+                    seek = window_end
+                else:
+                    seek += seek_offset
+                window_idx += 1
+        except asyncio.CancelledError:
+            logger.info(
+                "Request %s cancelled; aborting %d transcription engine request(s).",
+                request_id,
+                len(engine_request_ids),
+            )
+            await asyncio.gather(
+                self.engine_client.abort(engine_request_ids),
+                return_exceptions=True,
+            )
+            raise
+
+        separator = asr_inter_chunk_separator(
+            request.language, self.model_cls.no_space_languages
+        )
+        text = separator.join(segment.text for segment in all_segments)
+        if self.task_type == "transcribe":
+            return cast(
+                V,
+                TranscriptionResponseVerbose(
+                    text=text,
+                    language=request.language,
+                    duration=duration_s,
+                    segments=all_segments,
+                ),
+            )
+        return cast(
+            V,
+            TranslationResponseVerbose(
+                text=text,
+                language=request.language,
+                duration=duration_s,
+                segments=all_segments,
+            ),
+        )
 
     async def _create_speech_to_text(
         self,
@@ -483,6 +741,15 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         lora_request = self._maybe_get_adapters(request)
 
+        if request.response_format == "verbose_json":
+            return await self._create_seek_based_verbose_response(
+                audio_data=audio_data,
+                request=request,
+                raw_request=raw_request,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
         (
             engine_inputs,
             duration_s,
@@ -493,39 +760,10 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             request_id=request_id,
         )
 
-        # Schedule the request and get the result generator.
-        max_model_len = self.model_config.max_model_len
         list_result_generator: list[AsyncGenerator[RequestOutput, None]] | None = None
-
-        input_len = (
-            SpeechToTextBaseServing._get_decoder_prompt_len(engine_inputs)
-            if request.use_beam_search
-            else 0
+        sampling_params = self._get_speech_to_text_sampling_params(
+            request, engine_inputs
         )
-
-        # Unlike most decoder-only models, whisper generation length is not
-        # constrained by the size of the input audio, which is mapped to a
-        # fixed-size log-mel-spectogram. Still, allow for fewer tokens to be
-        # generated by respecting the extra completion tokens arg.
-        max_tokens = get_max_tokens(
-            max_model_len,
-            request.max_completion_tokens,
-            input_len,
-            self.default_sampling_params,
-        )
-
-        if request.use_beam_search:
-            sampling_params = request.to_beam_search_params(
-                max_tokens, self.default_sampling_params
-            )
-        else:
-            sampling_params = request.to_sampling_params(
-                max_tokens,
-                self.default_sampling_params,
-            )
-
-        if request.response_format == "verbose_json":
-            sampling_params.logprobs = 1
 
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
