@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for recovering audio abandoned inside a chunk.
+"""Unit and integration-style tests for recovering audio abandoned in a chunk.
 
 The numbers in these tests are measurements taken from a running
 whisper-large-v3-turbo deployment (see the issue this change fixes), not values
@@ -8,14 +8,23 @@ chosen to make the assertions pass: a fixture invented from memory would exercis
 a server that does not exist.
 """
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
+from numpy import zeros
 
 from vllm.entrypoints.speech_to_text.base.serving import (
     SPARSE_MIN_DURATION_S,
+    SpeechToTextBaseServing,
     is_sparse_recovery,
     last_decoded_timestamp,
     strip_seam_overlap,
 )
+from vllm.entrypoints.speech_to_text.transcription.protocol import (
+    TranscriptionResponseVerbose,
+)
+from vllm.sampling_params import SamplingParams
 
 
 class TestLastDecodedTimestamp:
@@ -78,3 +87,110 @@ class TestStripSeamOverlap:
         assert strip_seam_overlap("one two three four five", "one two three four five six") == (
             "one two three four five six"
         )
+
+
+class _TimestampTokenizer:
+    eos_token_id = 900
+
+    def encode(self, text, add_special_tokens=False):
+        assert text == "<|0.00|>"
+        return [1000]
+
+    def decode(self, token_ids):
+        return "".join(
+            {10: "first", 11: "tail one two three"}[token] for token in token_ids
+        )
+
+
+def _logprobs(tokens):
+    return [{token: SimpleNamespace(logprob=-0.1)} for token in tokens]
+
+
+def _output(tokens):
+    completion = SimpleNamespace(
+        token_ids=tokens,
+        logprobs=_logprobs(tokens),
+        text="",
+    )
+    return SimpleNamespace(outputs=[completion], finished=True)
+
+
+async def _result_generator(output):
+    yield output
+
+
+@pytest.mark.asyncio
+async def test_recovery_preserves_tail_and_monotonic_segments():
+    """An early EOT recovers its tail without overlapping segment timestamps."""
+    first_end_token = 1000 + round(26.4 / 0.02)
+    tail_end_token = 1000 + round(4.1 / 0.02)
+    outputs = [
+        _output((10, first_end_token, first_end_token, 900)),
+        _output((11, tail_end_token, tail_end_token, 900)),
+    ]
+
+    serving = SpeechToTextBaseServing.__new__(SpeechToTextBaseServing)
+    serving._check_model = AsyncMock(return_value=None)
+    serving._base_request_id = Mock(return_value="transcribe-test")
+    serving._maybe_get_adapters = Mock(return_value=None)
+    serving._log_inputs = Mock()
+    serving._parse_stt_prompt = Mock(return_value={"prompt": "recovery"})
+    serving.asr_config = SimpleNamespace(max_audio_clip_s=30, sample_rate=16_000)
+    serving.default_sampling_params = {}
+    serving.model_config = SimpleNamespace(max_model_len=100)
+    serving.task_type = "transcribe"
+    serving.tokenizer = _TimestampTokenizer()
+    serving.model_cls = SimpleNamespace(
+        no_space_languages=set(), supports_segment_timestamp=True
+    )
+    serving._preprocess_speech_to_text = AsyncMock(
+        return_value=(
+            [{"prompt": "chunk"}],
+            30.0,
+            [0.0],
+            [zeros(30 * 16_000)],
+        )
+    )
+    serving.renderer = SimpleNamespace(
+        render_cmpl_async=AsyncMock(return_value=[{"prompt": "recovery"}])
+    )
+    serving.engine_client = SimpleNamespace(
+        errored=False,
+        generate=Mock(side_effect=[_result_generator(output) for output in outputs]),
+    )
+
+    request = SimpleNamespace(
+        model="whisper",
+        language="en",
+        response_format="verbose_json",
+        stream=False,
+        use_beam_search=False,
+        max_completion_tokens=None,
+        temperature=0.0,
+        to_sampling_params=Mock(
+            return_value=SamplingParams(max_tokens=32, logprobs=1)
+        ),
+    )
+
+    response = await serving._create_speech_to_text(
+        audio_data=b"audio",
+        request=request,
+        raw_request=None,
+        response_class=TranscriptionResponseVerbose,
+        stream_generator_method=Mock(),
+    )
+
+    assert isinstance(response, TranscriptionResponseVerbose)
+    assert response.text == "first tail one two three"
+    assert [(segment.start, segment.end) for segment in response.segments] == [
+        pytest.approx((0.0, 26.4)),
+        pytest.approx((26.4, 30.0)),
+    ]
+    assert all(
+        previous.end <= current.start
+        for previous, current in zip(response.segments, response.segments[1:])
+    )
+    assert [call.args[2] for call in serving.engine_client.generate.call_args_list] == [
+        "transcribe-transcribe-test",
+        "transcribe-transcribe-test-recover-0",
+    ]

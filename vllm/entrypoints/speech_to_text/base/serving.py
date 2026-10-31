@@ -652,6 +652,13 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             if not trimmed:
                 continue
 
+            # Pre-roll is decoder context, not part of the public timeline.
+            if segments and chunk_segment_parts[idx]:
+                previous_end = chunk_segment_parts[idx][-1].end
+                for segment in segments:
+                    segment.start = max(segment.start, previous_end)
+                    previous_end = max(previous_end, segment.end)
+
             # The segments keep their own (untrimmed) text: the seam repetition is
             # a word or two, and rewriting a segment's text would desynchronise it
             # from the tokens and logprobs it was built from. The flat transcript
