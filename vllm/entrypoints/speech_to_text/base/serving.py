@@ -125,6 +125,14 @@ text" — exactly what the transcript had before the repair existed — so a fal
 positive costs nothing that was not already lost, while a false negative writes a
 sentence the speaker never said into the middle of their transcript."""
 
+SPARSE_MIN_CHARS_PER_S: Final[float] = 0.5
+"""Characters per second threshold for languages without spaces between words.
+
+This uses the same conservative rate as the word threshold: a short, complete
+Chinese or Japanese recovery should not be mistaken for a phantom merely because
+it has no whitespace-separated words.
+"""
+
 SEAM_MAX_OVERLAP_WORDS: Final[int] = 3
 """Longest repetition the seam de-duplicator removes. Tied to UNDECODED_PREROLL_S:
 half a second of speech is one or two words, three at a gallop. A wider window
@@ -147,12 +155,30 @@ def last_decoded_timestamp(tokens: tuple, init_token: int) -> float | None:
     return (last - init_token) * 0.02
 
 
-def is_sparse_recovery(text: str, duration_s: float) -> bool:
-    """True when a recovered region came back too thin to be speech."""
+def is_sparse_recovery(
+    text: str,
+    duration_s: float,
+    *,
+    language: str | None = None,
+    no_space_languages: set[str] | frozenset[str] = frozenset(),
+) -> bool:
+    """True when a recovered region came back too thin to be speech.
+
+    Languages without spaces between words are measured by alphanumeric
+    characters instead of whitespace-delimited words.
+    """
     if duration_s < SPARSE_MIN_DURATION_S:
         return False
-    words = len([word for word in text.strip().split() if word])
-    return words / duration_s < SPARSE_MIN_WORDS_PER_S
+    is_no_space_language = (
+        language is not None and language.lower() in no_space_languages
+    )
+    if is_no_space_language:
+        units = sum(char.isalnum() for char in text)
+        threshold = SPARSE_MIN_CHARS_PER_S
+    else:
+        units = len([word for word in text.strip().split() if word])
+        threshold = SPARSE_MIN_WORDS_PER_S
+    return units / duration_s < threshold
 
 
 def _seam_key(word: str) -> str:
@@ -636,7 +662,12 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
             # 🔴 The blocklist-free phantom test. An abandoned stretch is usually
             # silence, and Whisper does not stay quiet over silence.
-            if is_sparse_recovery(text, slice_duration):
+            if is_sparse_recovery(
+                text,
+                slice_duration,
+                language=request.language,
+                no_space_languages=self.model_cls.no_space_languages,
+            ):
                 logger.info(
                     "Recovered region %.2f-%.2fs of %s is not speech "
                     "(%d words over %.1fs); dropping it.",

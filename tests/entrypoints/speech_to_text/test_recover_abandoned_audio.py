@@ -63,6 +63,28 @@ class TestIsSparseRecovery:
     def test_does_not_judge_a_short_region_by_density(self):
         assert is_sparse_recovery("done", SPARSE_MIN_DURATION_S - 0.1) is False
 
+    def test_counts_characters_for_no_space_languages(self):
+        assert (
+            is_sparse_recovery(
+                "这是一个完整句子",
+                4.0,
+                language="zh",
+                no_space_languages={"zh", "ja"},
+            )
+            is False
+        )
+
+    def test_drops_sparse_no_space_language_recovery(self):
+        assert (
+            is_sparse_recovery(
+                "谢谢",
+                13.82,
+                language="zh",
+                no_space_languages={"zh", "ja"},
+            )
+            is True
+        )
+
 
 class TestStripSeamOverlap:
     """The pre-roll buys context at the price of a repeated word or two."""
